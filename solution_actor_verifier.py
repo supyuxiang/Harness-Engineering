@@ -207,44 +207,111 @@ class MyHarness(Harness):
             ).replace(
                 "{text}", text
             )
+        def fit_actor_messages(extra_tail: str = ""):
+            k = len(ordered_examples)
+            while k > 0:
+                user_content = build_user_content(ordered_examples[:k])
+                if extra_tail:
+                    user_content = user_content + "\n\n" + extra_tail
+                messages = [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_content},
+                ]
+                if self.count_messages_tokens(messages) <= self.max_prompt_tokens:
+                    return messages
+                k -= 1
 
-
-        k = len(ordered_examples)
-        while k > 0:
-            messages = [
+            fallback_user = (
+                "Candidates:\n"
+                f"{candidate_labels_block}\n\n"
+                "Task: choose one label for the input instance.\n"
+                "Think step by step, then respond in exactly two lines:\n"
+                "Reasoning: <step-by-step reasoning>\n"
+                "Label: <label>\n"
+                f"Input instance: {text}\n"
+                "Format reminder: Reasoning: ... then Label: <label>"
+            )
+            if extra_tail:
+                fallback_user = fallback_user + "\n\n" + extra_tail
+            return [
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": build_user_content(ordered_examples[:k])},
-            ]
-            if self.count_messages_tokens(messages) <= self.max_prompt_tokens:
-                break
-            k -= 1
-
-        if k == 0:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Candidates:\n"
-                        f"{candidate_labels_block}\n\n"
-                        "Task: choose one label for the input instance.\n"
-                        "Think step by step, then respond in exactly two lines:\n"
-                        "Reasoning: <step-by-step reasoning>\n"
-                        "Label: <label>\n"
-                        f"Input instance: {text}\n"
-                        "Format reminder: Reasoning: ... then Label: <label>"
-                    ),
-                },
+                {"role": "user", "content": fallback_user},
             ]
 
-        response = self.call_llm(messages).strip()
-        return self.extract_pred_lable_from_response(response)
+        # 1) actor: 初次生成
+        actor_messages = fit_actor_messages()
+        actor_response = self.call_llm(actor_messages).strip()
+        actor_label = self.extract_pred_lable_from_response(actor_response)
+
+        # 2) verifier: 对 actor 输出做复核与建议
+        verifier_system_prompt = (
+            "You are a strict verifier for text classification. "
+            "Check whether the actor's label is consistent with candidates and evidence. "
+            "Output exactly three lines:\n"
+            "Verification: <brief assessment>\n"
+            "Decision: <ACCEPT or REJECT>\n"
+            "Suggested label: <one label from candidates>"
+        )
+        verifier_user_content = (
+            "Candidates:\n"
+            f"{candidate_labels_block}\n\n"
+            f"Input instance:\n{text}\n\n"
+            f"Actor response:\n{actor_response}\n\n"
+            f"Actor extracted label: {actor_label}\n\n"
+            "Please verify actor's label and provide one suggested label from candidates."
+        )
+        verifier_messages = [
+            {"role": "system", "content": verifier_system_prompt},
+            {"role": "user", "content": verifier_user_content},
+        ]
+        if self.count_messages_tokens(verifier_messages) > self.max_prompt_tokens:
+            verifier_messages = [
+                {"role": "system", "content": verifier_system_prompt},
+                {"role": "user", "content": (
+                    "Candidates:\n"
+                    f"{candidate_labels_block}\n\n"
+                    f"Input instance:\n{text}\n\n"
+                    f"Actor extracted label: {actor_label}\n\n"
+                    "Output exactly three lines: Verification / Decision / Suggested label."
+                )},
+            ]
+        verifier_response = self.call_llm(verifier_messages).strip()
+        suggested_label = self.extract_pred_lable_from_response(verifier_response)
+
+        # 3) actor: 根据 verifier 意见再生成
+        regen_tail = (
+            "Verifier feedback:\n"
+            f"{verifier_response}\n\n"
+            f"Initial actor response:\n{actor_response}\n\n"
+            "Re-evaluate and regenerate the final answer.\n"
+            "Output exactly two lines:\n"
+            "Reasoning: <step-by-step reasoning>\n"
+            "Label: <label>"
+        )
+        regen_messages = fit_actor_messages(extra_tail=regen_tail)
+        regen_response = self.call_llm(regen_messages).strip()
+        regen_label = self.extract_pred_lable_from_response(regen_response)
+
+        if regen_label in labels:
+            return regen_label
+        if suggested_label in labels:
+            return suggested_label
+        return actor_label
 
     def verify(self, text:str, pred_label:str) -> bool:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": build_user_content(ordered_examples[:k])},
-        ]
+        labels = self.label_order[:] if self.label_order else list(dict.fromkeys(label for _, label in self.memory))
+        if pred_label not in labels:
+            return False
+        q = self.tokenize_fn(text)
+        support = 0
+        total = 0
+        for example in self.example_cache:
+            sim = self.sim_fn(q, example["tokens"])
+            if sim > 0:
+                total += 1
+                if example["label"] == pred_label:
+                    support += 1
+        return support >= max(1, total // 3)
 
     # utils 
     def set_seed(self, seed:int=42):
